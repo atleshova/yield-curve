@@ -24,6 +24,11 @@ def read_uploaded_file(uploaded_file):
 
     if filename.endswith(".CSV"):
         df = pd.read_csv(uploaded_file)
+else:
+    xls = pd.ExcelFile(uploaded_file)
+
+    if "Daily" in xls.sheet_names:
+        df = pd.read_excel(uploaded_file, sheet_name="Daily")
     else:
         df = pd.read_excel(uploaded_file)
 
