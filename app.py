@@ -1,96 +1,153 @@
 
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Nelson-Siegel Yield Curve Research App", layout="wide")
+st.set_page_config(page_title="Transparent Nelson-Siegel App", layout="wide")
 
+# Exact FRED maturity mapping.
+# Important: codes are matched exactly, so DGS30 is not confused with DGS3.
 MATURITY_MAP = {
     "DGS3MO": 0.25,
-    "DGS6MO": 0.5,
-    "DGS1": 1.0,
-    "DGS2": 2.0,
-    "DGS3": 3.0,
-    "DGS5": 5.0,
-    "DGS7": 7.0,
-    "DGS10": 10.0,
-    "DGS20": 20.0,
-    "DGS30": 30.0,
+    "DGS6MO": 0.50,
+    "DGS1": 1.00,
+    "DGS2": 2.00,
+    "DGS3": 3.00,
+    "DGS5": 5.00,
+    "DGS7": 7.00,
+    "DGS10": 10.00,
+    "DGS20": 20.00,
+    "DGS30": 30.00,
 }
 
-def read_uploaded_file(uploaded_file):
-    filename = uploaded_file.name.upper()
+ORDERED_CODES = sorted(MATURITY_MAP.keys(), key=len, reverse=True)
 
-    if filename.endswith(".CSV"):
+
+def detect_fred_code(filename, columns):
+    """
+    Detect the FRED code safely.
+    Fixes the earlier bug where DGS30 was accidentally detected as DGS3.
+    """
+    name = filename.upper()
+
+    # Exact filename match: DGS30.xlsx -> DGS30
+    stem = re.sub(r"\.(CSV|XLSX|XLS)$", "", name)
+    if stem in MATURITY_MAP:
+        return stem
+
+    # Search exact code tokens in filename
+    for code in ORDERED_CODES:
+        pattern = rf"(^|[^A-Z0-9]){code}([^A-Z0-9]|$)"
+        if re.search(pattern, name):
+            return code
+
+    # Search exact column names
+    clean_cols = [str(c).strip().upper() for c in columns]
+    for code in ORDERED_CODES:
+        if code in clean_cols:
+            return code
+
+    return None
+
+
+def read_uploaded_file(uploaded_file):
+    filename = uploaded_file.name
+
+    if filename.upper().endswith(".CSV"):
         df = pd.read_csv(uploaded_file)
+        sheet_used = "CSV"
     else:
         xls = pd.ExcelFile(uploaded_file)
         if "Daily" in xls.sheet_names:
             df = pd.read_excel(uploaded_file, sheet_name="Daily")
+            sheet_used = "Daily"
         else:
-            df = pd.read_excel(uploaded_file)
+            df = pd.read_excel(uploaded_file, sheet_name=xls.sheet_names[0])
+            sheet_used = xls.sheet_names[0]
 
     df.columns = [str(c).strip() for c in df.columns]
+    fred_code = detect_fred_code(filename, df.columns)
+
+    if fred_code is None:
+        raise ValueError(f"Could not detect FRED code from file name or columns: {filename}")
 
     date_col = None
     for c in df.columns:
-        if c.lower() in ["observation_date", "date"]:
+        if str(c).strip().lower() in ["observation_date", "date"]:
             date_col = c
             break
     if date_col is None:
         date_col = df.columns[0]
 
-    df = df.rename(columns={date_col: "Date"})
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df = df.dropna(subset=["Date"])
-
-    series_name = None
-    for code in MATURITY_MAP:
-        if code in filename:
-            series_name = code
-            break
-
-    if series_name is None:
-        for c in df.columns:
-            if c in MATURITY_MAP:
-                series_name = c
-                break
-
-    if series_name is not None and series_name in df.columns:
-        series_col = series_name
+    if fred_code in df.columns:
+        yield_col = fred_code
     else:
-        series_col = None
-        for c in df.columns:
-            if c != "Date":
-                numeric_test = pd.to_numeric(df[c], errors="coerce")
-                if numeric_test.notna().sum() > 0:
-                    series_col = c
-                    break
-        if series_name is None:
-            series_name = str(series_col)
+        possible_numeric = [c for c in df.columns if c != date_col]
+        yield_col = None
+        for c in possible_numeric:
+            if pd.to_numeric(df[c], errors="coerce").notna().sum() > 0:
+                yield_col = c
+                break
+        if yield_col is None:
+            raise ValueError(f"Could not find numeric yield column in {filename}")
 
-    if series_col is None:
-        raise ValueError(f"Could not identify yield column in {uploaded_file.name}")
+    out = df[[date_col, yield_col]].copy()
+    out.columns = ["Date", fred_code]
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
+    out[fred_code] = pd.to_numeric(out[fred_code], errors="coerce")
+    out = out.dropna(subset=["Date", fred_code])
+    out = out.sort_values("Date").drop_duplicates(subset=["Date"])
 
-    out = df[["Date", series_col]].copy()
-    out[series_col] = pd.to_numeric(out[series_col], errors="coerce")
-    out = out.dropna()
+    info = {
+        "file": filename,
+        "sheet_used": sheet_used,
+        "detected_code": fred_code,
+        "maturity_years": MATURITY_MAP[fred_code],
+        "rows_read": len(out),
+        "first_date": out["Date"].min(),
+        "last_date": out["Date"].max(),
+    }
 
-    if series_col != series_name:
-        out = out.rename(columns={series_col: series_name})
+    return out, info
 
-    return out, series_name
 
 def merge_files(uploaded_files):
-    merged = None
+    dfs = []
+    info_rows = []
+    seen = set()
+
     for f in uploaded_files:
-        df, _ = read_uploaded_file(f)
-        if merged is None:
-            merged = df
-        else:
-            merged = pd.merge(merged, df, on="Date", how="inner")
-    return merged.sort_values("Date").reset_index(drop=True)
+        df, info = read_uploaded_file(f)
+        code = info["detected_code"]
+
+        if code in seen:
+            raise ValueError(
+                f"Duplicate series detected: {code}. Upload only one file for each maturity."
+            )
+        seen.add(code)
+
+        dfs.append(df)
+        info_rows.append(info)
+
+    merged = dfs[0]
+    for df in dfs[1:]:
+        merged = pd.merge(merged, df, on="Date", how="inner")
+
+    yield_cols = [c for c in merged.columns if c != "Date"]
+    yield_cols = sorted(yield_cols, key=lambda c: MATURITY_MAP[c])
+    merged = merged[["Date"] + yield_cols].sort_values("Date").reset_index(drop=True)
+
+    return merged, pd.DataFrame(info_rows), yield_cols
+
+
+def monthly_last_observation(df):
+    temp = df.copy()
+    temp["Month"] = temp["Date"].dt.to_period("M")
+    out = temp.sort_values("Date").groupby("Month").tail(1)
+    return out.drop(columns=["Month"]).reset_index(drop=True)
+
 
 def ns_loadings(maturities, lambd):
     tau = np.asarray(maturities, dtype=float)
@@ -99,20 +156,28 @@ def ns_loadings(maturities, lambd):
     x2 = x1 - np.exp(-lambd * tau)
     return np.column_stack([x0, x1, x2])
 
+
 def nelson_siegel_yield(maturities, beta0, beta1, beta2, lambd):
     X = ns_loadings(maturities, lambd)
     return X @ np.array([beta0, beta1, beta2])
 
-def fit_ns_grid(yields, maturities, lambda_grid):
+
+def fit_ns_for_lambda(yields, maturities, lambd):
     y = np.asarray(yields, dtype=float)
-    best = None
+    X = ns_loadings(maturities, lambd)
+    betas, *_ = np.linalg.lstsq(X, y, rcond=None)
+    fitted = X @ betas
+    error = y - fitted
+    sse = float(np.sum(error ** 2))
+    return betas, fitted, error, sse, X
+
+
+def fit_ns_grid(yields, maturities, lambda_grid):
     rows = []
+    best = None
 
     for lambd in lambda_grid:
-        X = ns_loadings(maturities, lambd)
-        betas, *_ = np.linalg.lstsq(X, y, rcond=None)
-        fitted = X @ betas
-        sse = float(np.sum((y - fitted) ** 2))
+        betas, fitted, error, sse, X = fit_ns_for_lambda(yields, maturities, lambd)
         row = {
             "lambda": float(lambd),
             "beta0_level": float(betas[0]),
@@ -126,144 +191,205 @@ def fit_ns_grid(yields, maturities, lambda_grid):
 
     return best, pd.DataFrame(rows)
 
-def monthly_last_observation(df):
-    temp = df.copy()
-    temp["YearMonth"] = temp["Date"].dt.to_period("M")
-    monthly = temp.sort_values("Date").groupby("YearMonth").tail(1)
-    return monthly.drop(columns=["YearMonth"]).reset_index(drop=True)
 
-def estimate_factors_for_all_dates(df, yield_cols, lambda_min, lambda_max, lambda_step):
+def estimate_all_dates(model_data, yield_cols, lambda_grid):
     maturities = [MATURITY_MAP[c] for c in yield_cols]
-    lambda_grid = np.arange(lambda_min, lambda_max + lambda_step / 2, lambda_step)
     results = []
-
+    total = len(model_data)
     progress = st.progress(0)
-    total = len(df)
 
-    for i, (_, row) in enumerate(df.iterrows()):
-        y = row[yield_cols].values.astype(float)
-        best, _ = fit_ns_grid(y, maturities, lambda_grid)
+    for i, (_, row) in enumerate(model_data.iterrows()):
+        yields = row[yield_cols].to_numpy(dtype=float)
+        best, _ = fit_ns_grid(yields, maturities, lambda_grid)
         results.append({"Date": row["Date"], **best})
         progress.progress((i + 1) / total)
 
     return pd.DataFrame(results)
 
-def make_forecast_dataset(factors, horizon_months):
-    out = factors.copy()
-    out["future_beta0_level"] = out["beta0_level"].shift(-horizon_months)
-    out["future_beta1_slope"] = out["beta1_slope"].shift(-horizon_months)
-    out["future_beta2_curvature"] = out["beta2_curvature"].shift(-horizon_months)
-    return out.dropna().reset_index(drop=True)
 
-st.title("Nelson-Siegel Yield Curve Research App")
+def flag_results(best, lambda_min, lambda_max):
+    warnings = []
 
-st.write(
-    "Upload FRED Treasury yield CSV/XLSX files, estimate real Nelson-Siegel parameters "
-    "using grid search, visualize fitted curves, and export factor datasets."
+    if abs(best["lambda"] - lambda_min) < 1e-12:
+        warnings.append("Best lambda is at the minimum boundary. Try lowering lambda minimum or check maturity mapping.")
+    if abs(best["lambda"] - lambda_max) < 1e-12:
+        warnings.append("Best lambda is at the maximum boundary. Try raising lambda maximum.")
+    if max(abs(best["beta0_level"]), abs(best["beta1_slope"]), abs(best["beta2_curvature"])) > 100:
+        warnings.append("One or more beta values are extremely large. This usually means the curve is poorly identified, too few maturities are used, or lambda range is problematic.")
+
+    return warnings
+
+
+st.title("Transparent Nelson-Siegel Yield Curve App")
+
+st.markdown(
+    """
+This version is designed so you can **see what the model is doing**, instead of treating it like a black box.
+
+The Nelson-Siegel model fitted here is:
+
+$$
+y(\\tau)=\\beta_0+\\beta_1\\left(\\frac{1-e^{-\\lambda\\tau}}{\\lambda\\tau}\\right)
++\\beta_2\\left(\\frac{1-e^{-\\lambda\\tau}}{\\lambda\\tau}-e^{-\\lambda\\tau}\\right)
+$$
+"""
 )
 
 with st.sidebar:
     st.header("Settings")
-    frequency = st.radio("Frequency", ["Monthly last observation", "Daily"], index=0)
+    frequency = st.radio("Use data frequency", ["Monthly last observation", "Daily"], index=0)
     lambda_min = st.number_input("Lambda minimum", min_value=0.001, value=0.01, step=0.01, format="%.3f")
     lambda_max = st.number_input("Lambda maximum", min_value=0.01, value=5.00, step=0.10, format="%.3f")
     lambda_step = st.number_input("Lambda grid step", min_value=0.001, value=0.01, step=0.005, format="%.3f")
-    horizon_months = st.number_input("Forecast horizon", min_value=1, value=1, step=1)
+    forecast_horizon = st.number_input("Forecast horizon, rows/months", min_value=1, value=1, step=1)
+
+st.info(
+    "Upload FRED files such as DGS3MO.xlsx, DGS6MO.xlsx, DGS1.xlsx, DGS2.xlsx, DGS10.xlsx, DGS30.xlsx. "
+    "The app reads the FRED `Daily` sheet automatically when it exists."
+)
 
 uploaded_files = st.file_uploader(
-    "Upload FRED files such as DGS3MO.xlsx, DGS6MO.xlsx, DGS1.xlsx, DGS2.xlsx, DGS10.xlsx, DGS30.xlsx",
-    type=["csv", "xlsx"],
+    "Upload Treasury yield files",
+    type=["csv", "xlsx", "xls"],
     accept_multiple_files=True,
 )
 
 if not uploaded_files:
-    st.info("Upload at least four Treasury maturity files to begin.")
     st.stop()
 
 try:
-    merged = merge_files(uploaded_files)
+    merged, file_info, yield_cols = merge_files(uploaded_files)
 except Exception as e:
-    st.error(f"Could not read uploaded files: {e}")
+    st.error(str(e))
     st.stop()
 
-yield_cols = [c for c in merged.columns if c != "Date" and c in MATURITY_MAP]
-yield_cols = sorted(yield_cols, key=lambda c: MATURITY_MAP[c])
+st.header("1. File detection and maturity mapping")
+
+st.write("This table shows what the app thinks each uploaded file represents.")
+st.dataframe(file_info, use_container_width=True)
+
+mapping_df = pd.DataFrame({
+    "FRED code": yield_cols,
+    "Maturity in years": [MATURITY_MAP[c] for c in yield_cols],
+})
+st.dataframe(mapping_df, use_container_width=True)
 
 if len(yield_cols) < 4:
-    st.warning("Nelson-Siegel works better with at least four maturities. Upload more files if possible.")
+    st.warning("Use at least 4 maturities. Six or more is better. Nelson-Siegel has three beta parameters plus lambda.")
 
-st.header("1. Merged Yield Data")
-st.write(f"Detected series: {', '.join(yield_cols)}")
-st.dataframe(merged, use_container_width=True)
+st.header("2. Merged yield data")
+
+st.write("Only dates common to all uploaded files are kept.")
+st.write(f"Rows after merge: {len(merged)}")
+st.dataframe(merged.head(25), use_container_width=True)
 
 model_data = monthly_last_observation(merged) if frequency == "Monthly last observation" else merged.copy()
 
-st.subheader("Data used for estimation")
-st.write(f"Rows used: {len(model_data)}")
-st.dataframe(model_data.head(20), use_container_width=True)
+st.header("3. Data used for estimation")
+st.write(f"Frequency selected: **{frequency}**")
+st.write(f"Rows used for estimation: {len(model_data)}")
+st.dataframe(model_data.head(25), use_container_width=True)
 
-st.header("2. Single-Date Nelson-Siegel Fit")
+st.header("4. Single-date calculation, fully visible")
 
-selected_date = st.selectbox(
-    "Choose a date",
-    options=model_data["Date"].dt.strftime("%Y-%m-%d").tolist(),
-    index=len(model_data) - 1,
-)
+date_options = model_data["Date"].dt.strftime("%Y-%m-%d").tolist()
+selected_date = st.selectbox("Choose date", date_options, index=len(date_options) - 1)
 
-date_row = model_data[model_data["Date"].dt.strftime("%Y-%m-%d") == selected_date].iloc[0]
+row = model_data[model_data["Date"].dt.strftime("%Y-%m-%d") == selected_date].iloc[0]
 maturities = [MATURITY_MAP[c] for c in yield_cols]
-yields = date_row[yield_cols].values.astype(float)
+actual_yields = row[yield_cols].to_numpy(dtype=float)
+
+single_data = pd.DataFrame({
+    "FRED code": yield_cols,
+    "Maturity tau": maturities,
+    "Actual yield": actual_yields,
+})
+st.subheader("4A. Actual curve for selected date")
+st.dataframe(single_data, use_container_width=True)
+
 lambda_grid = np.arange(lambda_min, lambda_max + lambda_step / 2, lambda_step)
+best, grid_table = fit_ns_grid(actual_yields, maturities, lambda_grid)
 
-best, grid_table = fit_ns_grid(yields, maturities, lambda_grid)
-fitted = nelson_siegel_yield(
-    maturities,
-    best["beta0_level"],
-    best["beta1_slope"],
-    best["beta2_curvature"],
-    best["lambda"],
-)
+warnings = flag_results(best, lambda_min, lambda_max)
+for w in warnings:
+    st.warning(w)
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("β0 Level", f"{best['beta0_level']:.4f}")
-col2.metric("β1 Slope", f"{best['beta1_slope']:.4f}")
-col3.metric("β2 Curvature", f"{best['beta2_curvature']:.4f}")
-col4.metric("Best λ", f"{best['lambda']:.4f}")
+st.subheader("4B. Best grid-search result")
+
+cols = st.columns(5)
+cols[0].metric("Best lambda", f"{best['lambda']:.4f}")
+cols[1].metric("beta0 level", f"{best['beta0_level']:.4f}")
+cols[2].metric("beta1 slope", f"{best['beta1_slope']:.4f}")
+cols[3].metric("beta2 curvature", f"{best['beta2_curvature']:.4f}")
+cols[4].metric("SSE", f"{best['SSE']:.6f}")
+
+betas, fitted, errors, sse, X = fit_ns_for_lambda(actual_yields, maturities, best["lambda"])
+
+loading_df = pd.DataFrame({
+    "FRED code": yield_cols,
+    "tau": maturities,
+    "X0 beta0 loading": X[:, 0],
+    "X1 beta1 loading": X[:, 1],
+    "X2 beta2 loading": X[:, 2],
+})
+st.subheader("4C. Nelson-Siegel loadings")
+st.write("These are the equivalent of the Excel formula columns.")
+st.dataframe(loading_df, use_container_width=True)
 
 fit_df = pd.DataFrame({
-    "Maturity": maturities,
-    "Actual Yield": yields,
-    "Fitted Yield": fitted,
-    "Error": yields - fitted,
+    "FRED code": yield_cols,
+    "Maturity tau": maturities,
+    "Actual yield": actual_yields,
+    "Fitted yield": fitted,
+    "Error actual - fitted": errors,
+    "Squared error": errors ** 2,
 })
+st.subheader("4D. Fitted values and errors")
 st.dataframe(fit_df, use_container_width=True)
 
-fig, ax = plt.subplots()
-ax.plot(maturities, yields, marker="o", label="Actual")
+st.markdown(
+    """
+**What happened here?**
+
+1. The app tried many possible lambda values.
+2. For each lambda, it computed the two Nelson-Siegel loading columns.
+3. For that fixed lambda, beta0, beta1, and beta2 were estimated using ordinary least squares.
+4. The app calculated SSE, the sum of squared errors.
+5. The lambda with the smallest SSE was selected.
+"""
+)
+
+fig, ax = plt.subplots(figsize=(8, 4))
+ax.plot(maturities, actual_yields, marker="o", label="Actual")
 ax.plot(maturities, fitted, marker="o", label="Nelson-Siegel fitted")
 ax.set_xlabel("Maturity in years")
-ax.set_ylabel("Yield")
-ax.set_title(f"Nelson-Siegel Fit on {selected_date}")
+ax.set_ylabel("Yield, percent")
+ax.set_title(f"Actual vs fitted yield curve: {selected_date}")
 ax.legend()
 st.pyplot(fig)
 
-with st.expander("Show lambda grid search table"):
+with st.expander("Show full lambda grid search table"):
     st.dataframe(grid_table, use_container_width=True)
 
-st.header("3. Estimate Nelson-Siegel Factors for All Dates")
+st.header("5. Estimate factors for every date")
 
-if st.button("Run factor estimation"):
-    with st.spinner("Estimating factors..."):
-        st.session_state["factors"] = estimate_factors_for_all_dates(
-            model_data, yield_cols, lambda_min, lambda_max, lambda_step
-        )
+if st.button("Run estimation for all dates"):
+    with st.spinner("Running Nelson-Siegel grid search for all dates..."):
+        factors = estimate_all_dates(model_data, yield_cols, lambda_grid)
+        st.session_state["factors"] = factors
 
 if "factors" in st.session_state:
     factors = st.session_state["factors"]
-    st.subheader("Estimated Nelson-Siegel Factors")
+
+    st.subheader("Estimated factor table")
     st.dataframe(factors, use_container_width=True)
 
-    st.line_chart(factors.set_index("Date")[["beta0_level", "beta1_slope", "beta2_curvature", "lambda"]])
+    st.subheader("Factor chart")
+    chart_cols = ["beta0_level", "beta1_slope", "beta2_curvature", "lambda"]
+    st.line_chart(factors.set_index("Date")[chart_cols])
+
+    if (factors["lambda"] == lambda_min).mean() > 0.5:
+        st.warning("More than half of fitted dates choose the minimum lambda. Check whether your lambda range is too high or whether too few maturities are uploaded.")
 
     st.download_button(
         "Download Nelson-Siegel factors CSV",
@@ -272,24 +398,19 @@ if "factors" in st.session_state:
         mime="text/csv",
     )
 
-    st.header("4. Forecast Dataset")
-    forecast_df = make_forecast_dataset(factors, horizon_months)
-    st.dataframe(forecast_df, use_container_width=True)
+    st.header("6. Forecasting dataset")
+    forecast = factors.copy()
+    forecast["future_beta0_level"] = forecast["beta0_level"].shift(-forecast_horizon)
+    forecast["future_beta1_slope"] = forecast["beta1_slope"].shift(-forecast_horizon)
+    forecast["future_beta2_curvature"] = forecast["beta2_curvature"].shift(-forecast_horizon)
+    forecast = forecast.dropna().reset_index(drop=True)
+
+    st.write("This is the dataset you will later use for regression / random forest / XGBoost forecasting.")
+    st.dataframe(forecast, use_container_width=True)
 
     st.download_button(
         "Download forecasting dataset CSV",
-        data=forecast_df.to_csv(index=False).encode("utf-8"),
+        data=forecast.to_csv(index=False).encode("utf-8"),
         file_name="forecast_dataset.csv",
         mime="text/csv",
     )
-
-st.header("5. Explanation")
-st.markdown(
-    """
-    **Grid search** means the app tries many possible λ values.  
-    For each λ, it estimates β0, β1, and β2 by ordinary least squares.  
-    Then it chooses the λ with the lowest sum of squared errors.
-
-    This estimates the real Nelson-Siegel model without using Excel Solver.
-    """
-)
